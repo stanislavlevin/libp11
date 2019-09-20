@@ -28,9 +28,7 @@
 
 #include "engine.h"
 #include <stdio.h>
-#include <ctype.h>
 #include <string.h>
-#include <limits.h>
 
 static int hex_to_bin(ENGINE_CTX *ctx,
 		const char *in, unsigned char *out, size_t *outlen)
@@ -266,7 +264,7 @@ static int parse_uri_attr(ENGINE_CTX *ctx,
 }
 
 static int read_from_file(ENGINE_CTX *ctx,
-	const char *path, unsigned char *field, size_t *field_len)
+	const char *path, char *field, size_t *field_len)
 {
 	BIO *fp;
 
@@ -285,152 +283,6 @@ static int read_from_file(ENGINE_CTX *ctx,
 	return 1;
 }
 
-#if defined(_WIN32) || defined(_WIN64)
-#include <windows.h>
-#include <tchar.h> 
-#include <strsafe.h>
-
-static int read_from_command(ENGINE_CTX *ctx,
-	const char *cmd, unsigned char *field, size_t *field_len)
-{
-	SECURITY_ATTRIBUTES saAttr;
-
-	// Set the bInheritHandle flag so pipe handles are inherited. 
-	saAttr.nLength = sizeof(SECURITY_ATTRIBUTES); 
-	saAttr.bInheritHandle = TRUE; 
-	saAttr.lpSecurityDescriptor = NULL; 
-
-	HANDLE g_hChildStd_OUT_Rd = NULL;
-	HANDLE g_hChildStd_OUT_Wr = NULL;
-
-	// Create a pipe for the child process's STDOUT. 
-	if ( ! CreatePipe(&g_hChildStd_OUT_Rd, &g_hChildStd_OUT_Wr, &saAttr, 0) )
-		return 0;
-	// Ensure the read handle to the pipe for STDOUT is not inherited.
-	if ( ! SetHandleInformation(g_hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0) )
-		return 0;
-
-	// Create the child process. 
-	PROCESS_INFORMATION piProcInfo; 
-	STARTUPINFO siStartInfo;
-	BOOL bSuccess = FALSE; 
-
-	// Set up members of the PROCESS_INFORMATION structure. 
-
-	ZeroMemory( &piProcInfo, sizeof(PROCESS_INFORMATION) );
-
-	// Set up members of the STARTUPINFO structure. 
-	// This structure specifies the STDIN and STDOUT handles for redirection.
-
-	ZeroMemory( &siStartInfo, sizeof(STARTUPINFO) );
-	siStartInfo.cb = sizeof(STARTUPINFO); 
-	siStartInfo.hStdOutput = g_hChildStd_OUT_Wr;
-	siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
-
-	// Create the child process. 
-
-	bSuccess = CreateProcess(NULL, 
-	  TEXT(cmd),     // command line 
-	  NULL,          // process security attributes 
-	  NULL,          // primary thread security attributes 
-	  TRUE,          // handles are inherited 
-	  0,             // creation flags 
-	  NULL,          // use parent's environment 
-	  NULL,          // use parent's current directory 
-	  &siStartInfo,  // STARTUPINFO pointer 
-	  &piProcInfo);  // receives PROCESS_INFORMATION 
-
-	// If an error occurs, exit the application. 
-	if ( ! bSuccess ) {
-		return 0;
-	} else {
-		// Close handles to the child process and its primary thread.
-		// Some applications might keep these handles to monitor the status
-		// of the child process, for example. 
-
-		CloseHandle(piProcInfo.hProcess);
-		CloseHandle(piProcInfo.hThread);
-	}
-
-	// Read from pipe that is the standard output for child process. 
-	DWORD dwRead;
-	if (ReadFile( g_hChildStd_OUT_Rd, field, *field_len, &dwRead, NULL)) {
-		*field_len = dwRead;
-	} else {
-		*field_len = 0;
-	}
-	return 1;
-}
-
-#else
-
-#include <unistd.h>
-#include <sys/wait.h>
-
-extern char **environ;
-
-static int read_from_command(ENGINE_CTX *ctx,
-	const char *cmd, unsigned char *field, size_t *field_len)
-{
-	int pdes[2];
-	pid_t pid;
-
-	if (pipe(pdes) < 0) {
-		return 0;
-	}
-
-	switch (pid = fork()) {
-		case -1:
-			close(pdes[0]);
-			close(pdes[1]);
-			return 0;
-		case 0:
-			(void)close(pdes[0]);
-			if (pdes[1] != STDOUT_FILENO) {
-				dup2(pdes[1], STDOUT_FILENO);
-				close(pdes[0]);
-			}
-			char *argv[2];
-			argv[0] = (char *) cmd;
-			argv[1] = NULL;
-			execv(cmd, argv);
-			_exit(127);
-			/* NOTREACHED */
-	}
-
-	int status;
-	close(pdes[1]);
-	waitpid(pid, &status, 0);
-
-	if (read(pdes[0], field, *field_len) != -1) {
-		*field_len = strlen(field);
-	} else {
-		*field_len = 0;
-	}
-
-	close(pdes[0]);
-
-	return 1;
-}
-#endif
-
-
-static int strnicmp(const char *cs, const char *ct, size_t count)
-{
-	unsigned char c1, c2;
-
-	while (count) {
-		c1 = tolower(*cs++);
-		c2 = tolower(*ct++);
-		if (c1 != c2)
-			return c1 < c2 ? -1 : 1;
-		if (!c1)
-			break;
-		count--;
-	}
-	return 0;
-}
-
 static int parse_pin_source(ENGINE_CTX *ctx,
 		const char *attr, int attrlen, unsigned char *field,
 		size_t *field_len)
@@ -442,13 +294,14 @@ static int parse_pin_source(ENGINE_CTX *ctx,
 		return 0;
 	}
 
-	if (!strnicmp(val, "file:", 5)) {
-		ret = read_from_file(ctx, val + 5, field, field_len);
+	if (!strncasecmp((const char *)val, "file:", 5)) {
+		ret = read_from_file(ctx, (const char *)(val + 5), (char *)field, field_len);
 	} else if (*val == '|') {
-		ret = read_from_command(ctx, val + 1, field, field_len);
-	} else {
+		ret = 0
 		ctx_log(ctx, 0, "Unsupported pin-source syntax\n");
-		ret = 0;
+	/* 'pin-source=/foo/bar' is commonly used */
+	} else {
+		ret = read_from_file(ctx, (const char *)val, (char *)field, field_len);
 	}
 	OPENSSL_free(val);
 
@@ -505,7 +358,7 @@ int parse_pkcs11_uri(ENGINE_CTX *ctx,
 			pin_set = 1;
 		} else if (!strncmp(p, "pin-source=", 11)) {
 			p += 11;
-			rv = pin_set ? 0 : parse_pin_source(ctx, p, end - p, pin, pin_len);
+			rv = pin_set ? 0 : parse_pin_source(ctx, p, end - p, (unsigned char *)pin, pin_len);
 			pin_set = 1;
 		} else if (!strncmp(p, "type=", 5) || !strncmp(p, "object-type=", 12)) {
 			p = strchr(p, '=') + 1;
